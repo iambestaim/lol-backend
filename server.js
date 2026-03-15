@@ -113,6 +113,7 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
     }
 
     // --- 3.5 Lépés: OKOS ADATBÁZIS MENTÉS (LP TRACKING) ---
+    let lpChange = null;
     if (MONGO_URI && leagueData && leagueData.length > 0) {
         const soloQ = leagueData.find(q => q.queueType === 'RANKED_SOLO_5x5');
         if (soloQ) {
@@ -134,6 +135,16 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
                     });
                     await newRecord.save();
                     console.log(`[Adatbázis] Új LP/Rang frissítés elmentve: ${newRecord.riotId} -> ${soloQ.tier} ${soloQ.rank} (${soloQ.leaguePoints} LP)`);
+                }
+
+                // Visszaolvassuk az utolsó 2 mentést, hogy kiszámoljuk az LP változást!
+                const historyRecords = await PlayerHistory.find({ puuid: puuid }).sort({ date: -1 }).limit(2);
+                if (historyRecords.length === 2) {
+                    const current = historyRecords[0];
+                    const previous = historyRecords[1];
+                    const currentAbsLp = calculateAbsoluteLp(current.tier, current.rank, current.leaguePoints);
+                    const previousAbsLp = calculateAbsoluteLp(previous.tier, previous.rank, previous.leaguePoints);
+                    lpChange = currentAbsLp - previousAbsLp;
                 }
             } catch (dbErr) {
                 console.error('[Adatbázis] Hiba a mentéskor:', dbErr.message);
@@ -223,7 +234,8 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
         rankedData: leagueData,
         matchHistory: matchHistory,
         activeGame: activeGame,
-        masteryData: masteryData
+        masteryData: masteryData,
+        lpChange: lpChange
     });
 
   } catch (error) {
