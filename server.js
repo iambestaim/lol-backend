@@ -46,6 +46,14 @@ const playerHistorySchema = new mongoose.Schema({
 });
 const PlayerHistory = mongoose.model('PlayerHistory', playerHistorySchema);
 
+// LP Számoló segédfüggvény (hogy a divízió lépéseket is jól számolja)
+const TIER_VALUES = { "IRON": 0, "BRONZE": 400, "SILVER": 800, "GOLD": 1200, "PLATINUM": 1600, "EMERALD": 2000, "DIAMOND": 2400, "MASTER": 2800, "GRANDMASTER": 2800, "CHALLENGER": 2800 };
+const RANK_VALUES = { "IV": 0, "III": 100, "II": 200, "I": 300 };
+function calculateAbsoluteLp(tier, rank, lp) {
+    if (["MASTER", "GRANDMASTER", "CHALLENGER"].includes(tier.toUpperCase())) return TIER_VALUES[tier.toUpperCase()] + lp;
+    return (TIER_VALUES[tier.toUpperCase()] || 0) + (RANK_VALUES[rank.toUpperCase()] || 0) + lp;
+}
+
 const platformToRegional = {
   'eun1': 'europe', 'euw1': 'europe', 'tr1': 'europe', 'ru': 'europe',
   'na1': 'americas', 'br1': 'americas', 'la1': 'americas', 'la2': 'americas',
