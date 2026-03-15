@@ -37,6 +37,7 @@ const playerHistorySchema = new mongoose.Schema({
   puuid: String,
   riotId: String,
   region: String,
+  queueType: { type: String, default: 'RANKED_SOLO_5x5' },
   date: { type: Date, default: Date.now },
   tier: String,
   rank: String,
@@ -121,41 +122,41 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
     }
 
     // --- 3.5 Lépés: OKOS ADATBÁZIS MENTÉS (LP TRACKING) ---
-    let lpChange = null;
+    let lpChanges = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
     if (MONGO_URI && leagueData && leagueData.length > 0) {
-        const soloQ = leagueData.find(q => q.queueType === 'RANKED_SOLO_5x5');
-        if (soloQ) {
-            try {
-                // Megnézzük, mi volt a legutolsó elmentett állapota a játékosnak
-                const latestRecord = await PlayerHistory.findOne({ puuid: puuid }).sort({ date: -1 });
-                
-                // CSAK akkor mentünk új sort, ha változott a győzelmek/vereségek száma, vagy az LP-je! (Így nem spammeljük tele a DB-t)
-                if (!latestRecord || latestRecord.wins !== soloQ.wins || latestRecord.losses !== soloQ.losses || latestRecord.leaguePoints !== soloQ.leaguePoints) {
-                    const newRecord = new PlayerHistory({
-                        puuid: puuid,
-                        riotId: `${accountResponse.data.gameName}#${accountResponse.data.tagLine}`,
-                        region: actualRegion,
-                        tier: soloQ.tier,
-                        rank: soloQ.rank,
-                        leaguePoints: soloQ.leaguePoints,
-                        wins: soloQ.wins,
-                        losses: soloQ.losses
-                    });
-                    await newRecord.save();
-                    console.log(`[Adatbázis] Új LP/Rang frissítés elmentve: ${newRecord.riotId} -> ${soloQ.tier} ${soloQ.rank} (${soloQ.leaguePoints} LP)`);
-                }
+        for (const qType of ['RANKED_SOLO_5x5', 'RANKED_FLEX_SR']) {
+            const queueInfo = leagueData.find(q => q.queueType === qType);
+            if (queueInfo) {
+                try {
+                    const latestRecord = await PlayerHistory.findOne({ puuid: puuid, queueType: qType }).sort({ date: -1 });
+                    
+                    if (!latestRecord || latestRecord.wins !== queueInfo.wins || latestRecord.losses !== queueInfo.losses || latestRecord.leaguePoints !== queueInfo.leaguePoints) {
+                        const newRecord = new PlayerHistory({
+                            puuid: puuid,
+                            riotId: `${accountResponse.data.gameName}#${accountResponse.data.tagLine}`,
+                            region: actualRegion,
+                            queueType: qType,
+                            tier: queueInfo.tier,
+                            rank: queueInfo.rank,
+                            leaguePoints: queueInfo.leaguePoints,
+                            wins: queueInfo.wins,
+                            losses: queueInfo.losses
+                        });
+                        await newRecord.save();
+                        console.log(`[Adatbázis] Új ${qType} frissítés elmentve: ${newRecord.riotId} -> ${queueInfo.tier} ${queueInfo.rank} (${queueInfo.leaguePoints} LP)`);
+                    }
 
-                // Visszaolvassuk az utolsó 2 mentést, hogy kiszámoljuk az LP változást!
-                const historyRecords = await PlayerHistory.find({ puuid: puuid }).sort({ date: -1 }).limit(2);
-                if (historyRecords.length === 2) {
-                    const current = historyRecords[0];
-                    const previous = historyRecords[1];
-                    const currentAbsLp = calculateAbsoluteLp(current.tier, current.rank, current.leaguePoints);
-                    const previousAbsLp = calculateAbsoluteLp(previous.tier, previous.rank, previous.leaguePoints);
-                    lpChange = currentAbsLp - previousAbsLp;
+                    const historyRecords = await PlayerHistory.find({ puuid: puuid, queueType: qType }).sort({ date: -1 }).limit(2);
+                    if (historyRecords.length === 2) {
+                        const current = historyRecords[0];
+                        const previous = historyRecords[1];
+                        const currentAbsLp = calculateAbsoluteLp(current.tier, current.rank, current.leaguePoints);
+                        const previousAbsLp = calculateAbsoluteLp(previous.tier, previous.rank, previous.leaguePoints);
+                        lpChanges[qType] = currentAbsLp - previousAbsLp;
+                    }
+                } catch (dbErr) {
+                    console.error(`[Adatbázis] Hiba a ${qType} mentéskor:`, dbErr.message);
                 }
-            } catch (dbErr) {
-                console.error('[Adatbázis] Hiba a mentéskor:', dbErr.message);
             }
         }
     }
@@ -243,7 +244,7 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
         matchHistory: matchHistory,
         activeGame: activeGame,
         masteryData: masteryData,
-        lpChange: lpChange
+        lpChanges: lpChanges
     });
 
   } catch (error) {
