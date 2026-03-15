@@ -87,6 +87,35 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
         console.log(`[Figyelmeztetés] A Riot megtagadta a Ranked adatokat (státusz: ${leagueErr.response ? leagueErr.response.status : 'ismeretlen'}).`);
     }
 
+    // --- 3.5 Lépés: OKOS ADATBÁZIS MENTÉS (LP TRACKING) ---
+    if (MONGO_URI && leagueData && leagueData.length > 0) {
+        const soloQ = leagueData.find(q => q.queueType === 'RANKED_SOLO_5x5');
+        if (soloQ) {
+            try {
+                // Megnézzük, mi volt a legutolsó elmentett állapota a játékosnak
+                const latestRecord = await PlayerHistory.findOne({ puuid: puuid }).sort({ date: -1 });
+                
+                // CSAK akkor mentünk új sort, ha változott a győzelmek/vereségek száma, vagy az LP-je! (Így nem spammeljük tele a DB-t)
+                if (!latestRecord || latestRecord.wins !== soloQ.wins || latestRecord.losses !== soloQ.losses || latestRecord.leaguePoints !== soloQ.leaguePoints) {
+                    const newRecord = new PlayerHistory({
+                        puuid: puuid,
+                        riotId: `${accountResponse.data.gameName}#${accountResponse.data.tagLine}`,
+                        region: actualRegion,
+                        tier: soloQ.tier,
+                        rank: soloQ.rank,
+                        leaguePoints: soloQ.leaguePoints,
+                        wins: soloQ.wins,
+                        losses: soloQ.losses
+                    });
+                    await newRecord.save();
+                    console.log(`[Adatbázis] Új LP/Rang frissítés elmentve: ${newRecord.riotId} -> ${soloQ.tier} ${soloQ.rank} (${soloQ.leaguePoints} LP)`);
+                }
+            } catch (dbErr) {
+                console.error('[Adatbázis] Hiba a mentéskor:', dbErr.message);
+            }
+        }
+    }
+
     // 4. Lépés: Utolsó 20 meccs lekérése (A statisztikai kártyához és a listához)
     let matchHistory = [];
     try {
