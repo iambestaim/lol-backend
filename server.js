@@ -3,6 +3,7 @@ require('dotenv').config(); // .env fájl tartalmának betöltése
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const mongoose = require('mongoose');
 
 // Express alkalmazás létrehozása
 const app = express();
@@ -20,6 +21,30 @@ if (!RIOT_API_KEY) {
   console.error("HIBA: A RIOT_API_KEY környezeti változó nincs beállítva! Ellenőrizd a .env fájlt.");
   process.exit(1); // Leállítjuk a szervert, ha nincs kulcs.
 }
+
+// --- ADATBÁZIS CSATLAKOZÁS ÉS BEÁLLÍTÁS ---
+const MONGO_URI = process.env.MONGO_URI;
+if (MONGO_URI) {
+  mongoose.connect(MONGO_URI)
+    .then(() => console.log('✅ Sikeresen csatlakozva a MongoDB adatbázishoz!'))
+    .catch(err => console.error('❌ MongoDB csatlakozási hiba:', err));
+} else {
+  console.log('⚠️ Nincs MONGO_URI beállítva. Az adatgyűjtés szünetel.');
+}
+
+// Adatbázis séma (Hogyan nézzen ki egy mentett rang-rekord)
+const playerHistorySchema = new mongoose.Schema({
+  puuid: String,
+  riotId: String,
+  region: String,
+  date: { type: Date, default: Date.now },
+  tier: String,
+  rank: String,
+  leaguePoints: Number,
+  wins: Number,
+  losses: Number
+});
+const PlayerHistory = mongoose.model('PlayerHistory', playerHistorySchema);
 
 const platformToRegional = {
   'eun1': 'europe', 'euw1': 'europe', 'tr1': 'europe', 'ru': 'europe',
