@@ -316,6 +316,29 @@ app.get('/match/:region/:matchId/timeline', async (req, res) => {
   }
 });
 
+// ÚJ VÉGPONT: Autocomplete kereső (Adatbázisból)
+app.get('/api/autocomplete', async (req, res) => {
+  const q = req.query.q;
+  if (!q || q.length < 3 || !MONGO_URI) return res.json([]);
+
+  try {
+    // Kis- és nagybetű független keresés a "data.name" mezőn (pl: Játékos#EUW)
+    const results = await SummonerCache.find({
+        "data.name": { $regex: q, $options: "i" }
+    }).limit(5); // Maximum 5 találatot adunk vissza, hogy gyors maradjon
+
+    const formattedResults = results.map(doc => ({
+        name: doc.data.name,
+        profileIconId: doc.data.profileIconId,
+        region: doc.data.activeRegion
+    }));
+
+    res.json(formattedResults);
+  } catch (error) {
+    res.status(500).json([]);
+  }
+});
+
 // --- RENDER ÉBRENTARTÓ (KEEP-AWAKE) ---
 // Ez az egyszerű végpont csak annyit csinál, hogy válaszol. Nem terheli a Riot API-t.
 app.get('/ping', (req, res) => {
