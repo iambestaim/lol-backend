@@ -168,6 +168,7 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
         // --- OKOS ADATBÁZIS MENTÉS ÉS MECCSENKÉNTI LP KISZÁMÍTÁSA ---
         let lpChanges = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
         let matchLpChanges = {};
+        let lpHistory = { 'RANKED_SOLO_5x5': [], 'RANKED_FLEX_SR': [] }; // Grafikon adatok
 
         if (MONGO_URI && leagueData && leagueData.length > 0) {
             const soloMatches = matchHistory.filter(m => m.info.queueId === 420);
@@ -205,6 +206,14 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
                                 }
                             }
                         }
+                        
+                        // Időrendben (legrégebbi elöl) mentjük az LP adatokat a grafikonhoz
+                        lpHistory[qType] = historyRecords.reverse().map(r => ({
+                            lp: r.leaguePoints,
+                            tier: r.tier,
+                            rank: r.rank,
+                            absLp: calculateAbsoluteLp(r.tier, r.rank, r.leaguePoints)
+                        }));
                     } catch (dbErr) {
                         console.error(`[Adatbázis] Hiba a ${qType} mentéskor:`, dbErr.message);
                     }
@@ -220,7 +229,8 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
             matchHistory: matchHistory,
             masteryData: masteryData,
             lpChanges: lpChanges,
-            matchLpChanges: matchLpChanges
+            matchLpChanges: matchLpChanges,
+            lpHistory: lpHistory
         };
 
         // Adatok elmentése az adatbázis memóriájába
