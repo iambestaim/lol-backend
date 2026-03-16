@@ -48,6 +48,15 @@ const playerHistorySchema = new mongoose.Schema({
 });
 const PlayerHistory = mongoose.model('PlayerHistory', playerHistorySchema);
 
+// Gyorsítótár (Cache) séma a masszív API hívások elkerülésére
+const summonerCacheSchema = new mongoose.Schema({
+  puuid: String,
+  revisionDate: Number,
+  data: Object,
+  updatedAt: { type: Date, default: Date.now }
+});
+const SummonerCache = mongoose.model('SummonerCache', summonerCacheSchema);
+
 // LP Számoló segédfüggvény (hogy a divízió lépéseket is jól számolja)
 const TIER_VALUES = { "IRON": 0, "BRONZE": 400, "SILVER": 800, "GOLD": 1200, "PLATINUM": 1600, "EMERALD": 2000, "DIAMOND": 2400, "MASTER": 2800, "GRANDMASTER": 2800, "CHALLENGER": 2800 };
 const RANK_VALUES = { "IV": 0, "III": 100, "II": 200, "I": 300 };
@@ -99,176 +108,170 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
     }
     const puuid = accountResponse.data.puuid;
 
-    // 2. Lépés: Summoner API a kiválasztott régióban
-    const summonerUrl = `https://${region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${puuid}`;
-    let summonerData = null;
+    // --- GYORSÍTÁS 2.0: OKOS CACHE (ADATBÁZIS) ÉS PÁRHUZAMOSÍTÁS ---
     let actualRegion = region;
+    const summonerUrl = `https://${region}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${puuid}`;
+    const spectatorUrl = `https://${actualRegion}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
 
-    try {
-        const summonerResponse = await axios.get(summonerUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-        summonerData = summonerResponse.data;
-    } catch (err) {
-        // Ha itt hiba van, bypass-hoz alapértéket adunk
-        summonerData = { puuid: puuid, summonerLevel: 1, profileIconId: 1 };
-    }
+    // 1. Lépés: Csak a Profilt és az Élő meccset kérjük le először (Ez villámgyors)
+    const [summonerRes, spectatorRes] = await Promise.allSettled([
+        axios.get(summonerUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } }),
+        axios.get(spectatorUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } })
+    ]);
 
-    // 3. Lépés: Ranked adatok lekérése a PUUID alapján (EZ VOLT A MEGOLDÁS!)
-    let leagueData = [];
-    try {
-        const leagueUrl = `https://${actualRegion}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(puuid)}`;
-        const leagueResponse = await axios.get(leagueUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-        leagueData = leagueResponse.data;
-    } catch (leagueErr) {
-        console.log(`[Figyelmeztetés] A Riot megtagadta a Ranked adatokat (státusz: ${leagueErr.response ? leagueErr.response.status : 'ismeretlen'}).`);
-    }
+    let summonerData = summonerRes.status === 'fulfilled' ? summonerRes.value.data : { puuid: puuid, summonerLevel: 1, profileIconId: 1, revisionDate: 0 };
+    let activeGame = spectatorRes.status === 'fulfilled' ? spectatorRes.value.data : null;
 
-    // 3.5 Lépés: Utolsó 20 meccs lekérése (Ez előrébb jön, hogy el tudjuk menteni a matchId-t a DB-be!)
-    let matchHistory = [];
-    try {
-        const matchIdsUrl = `https://${regionalRoute}.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=20`;
-        const matchIdsResponse = await axios.get(matchIdsUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-        const matchIds = matchIdsResponse.data;
+    let finalResponseData = null;
 
-        // Rate Limit (Túl sok kérés) elkerülése érdekében 5-ösével kérjük le a meccseket
-        for (let i = 0; i < matchIds.length; i += 5) {
-            const batch = matchIds.slice(i, i + 5);
-            const matchPromises = batch.map(matchId => {
-                return axios.get(`https://${regionalRoute}.api.riotgames.com/lol/match/v5/matches/${matchId}`, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-            });
-            const batchResponses = await Promise.all(matchPromises);
-            matchHistory.push(...batchResponses.map(res => res.data));
+    // 2. Lépés: Gyorsítótár (Cache) ellenőrzése a revisionDate alapján
+    if (MONGO_URI && summonerData.revisionDate) {
+        try {
+            const cachedProfile = await SummonerCache.findOne({ puuid: puuid });
+            if (cachedProfile && cachedProfile.revisionDate === summonerData.revisionDate) {
+                console.log(`[Gyorsítótár] Adatok betöltve az adatbázisból (villámgyors, nincs változás): ${gameName}#${tagLine}`);
+                finalResponseData = cachedProfile.data;
+            }
+        } catch (err) {
+            console.log('[Gyorsítótár] Hiba a cache olvasásakor:', err.message);
         }
-    } catch (matchErr) {
-        console.log(`[Figyelmeztetés] A meccselőzmények lekérése sikertelen volt:`, matchErr.response ? matchErr.response.status : matchErr.message);
     }
 
-    // 4. Lépés: OKOS ADATBÁZIS MENTÉS ÉS MECCSENKÉNTI LP KISZÁMÍTÁSA
-    let lpChanges = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
-    let matchLpChanges = {}; // Ide mentjük, hogy pontosan melyik matchId mennyi LP-t adott
+    // 3. Lépés: Ha nincs meg a Cache-ben (vagy elavult), letöltjük a "nehéz" adatokat a Riottól
+    if (!finalResponseData) {
+        console.log(`[API] Új adatok letöltése a Riottól: ${gameName}#${tagLine}`);
+        
+        const leagueUrl = `https://${actualRegion}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(puuid)}`;
+        const matchIdsUrl = `https://${regionalRoute}.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids?start=0&count=20`;
+        const masteryUrl = `https://${actualRegion}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/${encodeURIComponent(puuid)}/top?count=10`;
 
-    if (MONGO_URI && leagueData && leagueData.length > 0) {
-        const soloMatches = matchHistory.filter(m => m.info.queueId === 420);
-        const flexMatches = matchHistory.filter(m => m.info.queueId === 440);
-        const latestMatches = {
-            'RANKED_SOLO_5x5': soloMatches.length > 0 ? soloMatches[0].metadata.matchId : null,
-            'RANKED_FLEX_SR': flexMatches.length > 0 ? flexMatches[0].metadata.matchId : null
-        };
+        const [leagueRes, matchIdsRes, masteryRes] = await Promise.allSettled([
+            axios.get(leagueUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } }),
+            axios.get(matchIdsUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } }),
+            axios.get(masteryUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } })
+        ]);
 
-        for (const qType of ['RANKED_SOLO_5x5', 'RANKED_FLEX_SR']) {
-            const queueInfo = leagueData.find(q => q.queueType === qType);
-            if (queueInfo) {
-                try {
-                    const latestRecord = await PlayerHistory.findOne({ puuid: puuid, queueType: qType }).sort({ date: -1 });
-                    
-                    if (!latestRecord || latestRecord.wins !== queueInfo.wins || latestRecord.losses !== queueInfo.losses || latestRecord.leaguePoints !== queueInfo.leaguePoints) {
-                        const newRecord = new PlayerHistory({
-                            puuid: puuid,
-                            riotId: `${accountResponse.data.gameName}#${accountResponse.data.tagLine}`,
-                            region: actualRegion,
-                            queueType: qType,
-                            tier: queueInfo.tier,
-                            rank: queueInfo.rank,
-                            leaguePoints: queueInfo.leaguePoints,
-                            wins: queueInfo.wins,
-                            losses: queueInfo.losses,
-                            matchId: latestMatches[qType] // ÚJ: Elmentjük a legutóbbi meccs azonosítóját!
-                        });
-                        await newRecord.save();
-                        console.log(`[Adatbázis] Új ${qType} frissítés elmentve: ${newRecord.riotId} -> ${queueInfo.tier} ${queueInfo.rank} (${queueInfo.leaguePoints} LP) -> Match: ${latestMatches[qType]}`);
-                    }
+        let leagueData = leagueRes.status === 'fulfilled' ? leagueRes.value.data : [];
+        let matchIds = matchIdsRes.status === 'fulfilled' ? matchIdsRes.value.data : [];
+        let masteryData = masteryRes.status === 'fulfilled' ? masteryRes.value.data : [];
 
-                    // Visszaolvassuk az utolsó 20 mentést, hogy minden korábbi meccshez hozzárendeljük a pontos LP-t
-                    const historyRecords = await PlayerHistory.find({ puuid: puuid, queueType: qType }).sort({ date: -1 }).limit(20);
-                    if (historyRecords.length >= 2) {
-                        // Az utolsó frissítés óta történt teljes változás (Bal oldali Ranked sávba)
-                        const currentAbsLp = calculateAbsoluteLp(historyRecords[0].tier, historyRecords[0].rank, historyRecords[0].leaguePoints);
-                        const previousAbsLp = calculateAbsoluteLp(historyRecords[1].tier, historyRecords[1].rank, historyRecords[1].leaguePoints);
-                        lpChanges[qType] = currentAbsLp - previousAbsLp;
+        let matchHistory = [];
+        if (matchIds.length > 0) {
+            for (let i = 0; i < matchIds.length; i += 10) {
+                const batch = matchIds.slice(i, i + 10);
+                const matchPromises = batch.map(matchId => axios.get(`https://${regionalRoute}.api.riotgames.com/lol/match/v5/matches/${matchId}`, { headers: { 'X-Riot-Token': RIOT_API_KEY } }));
+                const batchResponses = await Promise.allSettled(matchPromises);
+                matchHistory.push(...batchResponses.filter(r => r.status === 'fulfilled').map(r => r.value.data));
+            }
+        }
 
-                        // Minden egyes rögzített meccs ID-hoz kiszámoljuk a konkrét LP nyereséget/veszteséget
-                        for (let i = 0; i < historyRecords.length - 1; i++) {
-                            const curr = historyRecords[i];
-                            const prev = historyRecords[i+1];
-                            if (curr.matchId) {
-                                const cLp = calculateAbsoluteLp(curr.tier, curr.rank, curr.leaguePoints);
-                                const pLp = calculateAbsoluteLp(prev.tier, prev.rank, prev.leaguePoints);
-                                matchLpChanges[curr.matchId] = cLp - pLp;
+        // --- OKOS ADATBÁZIS MENTÉS ÉS MECCSENKÉNTI LP KISZÁMÍTÁSA ---
+        let lpChanges = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
+        let matchLpChanges = {};
+
+        if (MONGO_URI && leagueData && leagueData.length > 0) {
+            const soloMatches = matchHistory.filter(m => m.info.queueId === 420);
+            const flexMatches = matchHistory.filter(m => m.info.queueId === 440);
+            const latestMatches = {
+                'RANKED_SOLO_5x5': soloMatches.length > 0 ? soloMatches[0].metadata.matchId : null,
+                'RANKED_FLEX_SR': flexMatches.length > 0 ? flexMatches[0].metadata.matchId : null
+            };
+
+            for (const qType of ['RANKED_SOLO_5x5', 'RANKED_FLEX_SR']) {
+                const queueInfo = leagueData.find(q => q.queueType === qType);
+                if (queueInfo) {
+                    try {
+                        const latestRecord = await PlayerHistory.findOne({ puuid: puuid, queueType: qType }).sort({ date: -1 });
+                        
+                        if (!latestRecord || latestRecord.wins !== queueInfo.wins || latestRecord.losses !== queueInfo.losses || latestRecord.leaguePoints !== queueInfo.leaguePoints) {
+                            const newRecord = new PlayerHistory({
+                                puuid: puuid, riotId: `${gameName}#${tagLine}`,
+                                region: actualRegion, queueType: qType, tier: queueInfo.tier, rank: queueInfo.rank,
+                                leaguePoints: queueInfo.leaguePoints, wins: queueInfo.wins, losses: queueInfo.losses, matchId: latestMatches[qType]
+                            });
+                            await newRecord.save();
+                        }
+
+                        const historyRecords = await PlayerHistory.find({ puuid: puuid, queueType: qType }).sort({ date: -1 }).limit(20);
+                        if (historyRecords.length >= 2) {
+                            const currentAbsLp = calculateAbsoluteLp(historyRecords[0].tier, historyRecords[0].rank, historyRecords[0].leaguePoints);
+                            const previousAbsLp = calculateAbsoluteLp(historyRecords[1].tier, historyRecords[1].rank, historyRecords[1].leaguePoints);
+                            lpChanges[qType] = currentAbsLp - previousAbsLp;
+
+                            for (let i = 0; i < historyRecords.length - 1; i++) {
+                                const curr = historyRecords[i], prev = historyRecords[i+1];
+                                if (curr.matchId) {
+                                    matchLpChanges[curr.matchId] = calculateAbsoluteLp(curr.tier, curr.rank, curr.leaguePoints) - calculateAbsoluteLp(prev.tier, prev.rank, prev.leaguePoints);
+                                }
                             }
                         }
+                    } catch (dbErr) {
+                        console.error(`[Adatbázis] Hiba a ${qType} mentéskor:`, dbErr.message);
                     }
-                } catch (dbErr) {
-                    console.error(`[Adatbázis] Hiba a ${qType} mentéskor:`, dbErr.message);
                 }
+            }
+        }
+
+        finalResponseData = {
+            ...summonerData,
+            name: `${gameName}#${tagLine}`,
+            activeRegion: actualRegion.toUpperCase(),
+            rankedData: leagueData,
+            matchHistory: matchHistory,
+            masteryData: masteryData,
+            lpChanges: lpChanges,
+            matchLpChanges: matchLpChanges
+        };
+
+        // Adatok elmentése az adatbázis memóriájába
+        if (MONGO_URI) {
+            try {
+                await SummonerCache.findOneAndUpdate(
+                    { puuid: puuid },
+                    { puuid: puuid, revisionDate: summonerData.revisionDate, data: finalResponseData, updatedAt: Date.now() },
+                    { upsert: true }
+                );
+            } catch (err) {
+                console.error('[Gyorsítótár] Hiba a cache írásakor:', err.message);
             }
         }
     }
 
-    // 5. Lépés: Élő meccs (Spectator API) lekérése
-    let activeGame = null;
-    try {
-        const spectatorUrl = `https://${actualRegion}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/${encodeURIComponent(puuid)}`;
-        const spectatorResponse = await axios.get(spectatorUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-        activeGame = spectatorResponse.data;
-
-        // Játékosok rangjának gyors lekérése az élő meccshez
-        if (activeGame && activeGame.participants) {
-            const rankPromises = activeGame.participants.map(async (p) => {
-                try {
-                    const rankUrl = `https://${actualRegion}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(p.puuid)}`;
-                    const rankRes = await axios.get(rankUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-                    const soloQ = rankRes.data.find(q => q.queueType === 'RANKED_SOLO_5x5');
-                    if (soloQ) {
-                        // Formázzuk szebbre (pl. PLATINUM III -> Platinum III)
-                        const formattedTier = soloQ.tier.charAt(0) + soloQ.tier.slice(1).toLowerCase();
-                        p.rankStr = `${formattedTier} ${soloQ.rank}`;
-                        p.wins = soloQ.wins;
-                        p.losses = soloQ.losses;
-                        if (soloQ.miniSeries) p.promos = soloQ.miniSeries.progress;
-                    } else {
-                        p.rankStr = 'Unranked';
-                    }
-                } catch (e) {
+    // 4. Lépés: Élő Meccs Játékosainak Feldolgozása (Ez folyamatosan lefut, mivel a meccs "élő")
+    if (activeGame && activeGame.participants) {
+        const rankPromises = activeGame.participants.map(async (p) => {
+            try {
+                const rankUrl = `https://${actualRegion}.api.riotgames.com/lol/league/v4/entries/by-puuid/${encodeURIComponent(p.puuid)}`;
+                const rankRes = await axios.get(rankUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
+                const soloQ = rankRes.data.find(q => q.queueType === 'RANKED_SOLO_5x5');
+                if (soloQ) {
+                    const formattedTier = soloQ.tier.charAt(0) + soloQ.tier.slice(1).toLowerCase();
+                    p.rankStr = `${formattedTier} ${soloQ.rank}`;
+                    p.wins = soloQ.wins;
+                    p.losses = soloQ.losses;
+                    if (soloQ.miniSeries) p.promos = soloQ.miniSeries.progress;
+                } else {
                     p.rankStr = 'Unranked';
                 }
+            } catch (e) {
+                p.rankStr = 'Unranked';
+            }
 
-                // ÚJ: Hős Mastery lekérése az aktuális hősre
-                try {
-                    const masteryUrl = `https://${actualRegion}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/${encodeURIComponent(p.puuid)}/by-champion/${p.championId}`;
-                    const masteryRes = await axios.get(masteryUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-                    p.currentChampMastery = masteryRes.data.championPoints;
-                } catch (e) {
-                    p.currentChampMastery = 0; // Ha 404, akkor még sosem játszott vele
-                }
-                return p;
-            });
-            await Promise.all(rankPromises); // Párhuzamosan kérjük le a 10 rangot, hogy gyors legyen!
-        }
-    } catch (specErr) {
-        // Ha 404-et kapunk, a játékos egyszerűen nincs meccsben, ez teljesen normális.
+            try {
+                const masteryUrl = `https://${actualRegion}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/${encodeURIComponent(p.puuid)}/by-champion/${p.championId}`;
+                const masteryRes = await axios.get(masteryUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
+                p.currentChampMastery = masteryRes.data.championPoints;
+            } catch (e) {
+                p.currentChampMastery = 0;
+            }
+            return p;
+        });
+        await Promise.all(rankPromises);
     }
 
-    // 6. Lépés: Top 10 Champion Mastery lekérése
-    let masteryData = [];
-    try {
-        const masteryUrl = `https://${actualRegion}.api.riotgames.com/lol/champion-mastery/v4/champion-masteries/by-puuid/${encodeURIComponent(puuid)}/top?count=10`;
-        const masteryResponse = await axios.get(masteryUrl, { headers: { 'X-Riot-Token': RIOT_API_KEY } });
-        masteryData = masteryResponse.data;
-    } catch (err) {
-        console.log(`[Figyelmeztetés] A Champion Mastery lekérése sikertelen volt.`);
-    }
-
-    // Válasz elküldése a frontendnek
-    res.json({
-        ...summonerData,
-        name: `${accountResponse.data.gameName}#${accountResponse.data.tagLine}`,
-        activeRegion: actualRegion.toUpperCase(),
-        rankedData: leagueData,
-        matchHistory: matchHistory,
-        activeGame: activeGame,
-        masteryData: masteryData,
-        lpChanges: lpChanges,
-        matchLpChanges: matchLpChanges
-    });
+    // Végső adatok elküldése
+    finalResponseData.activeGame = activeGame; // Élő meccs hozzácsatolása (mivel az folyamatosan változik)
+    res.json(finalResponseData);
 
   } catch (error) {
       console.error(error);
