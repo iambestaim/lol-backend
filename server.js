@@ -316,6 +316,19 @@ app.get('/match/:region/:matchId/timeline', async (req, res) => {
   }
 });
 
+// --- RENDER ÉBRENTARTÓ (KEEP-AWAKE) ---
+// Ez az egyszerű végpont csak annyit csinál, hogy válaszol. Nem terheli a Riot API-t.
+app.get('/ping', (req, res) => {
+  res.status(200).send('A szerver ébren van! 🚀');
+});
+
+const RENDER_URL = 'https://lol-backend-1nc9.onrender.com'; // A te Render címed
+setInterval(() => {
+  axios.get(`${RENDER_URL}/ping`)
+    .then(() => console.log('✅ [Ébrentartó] Ping küldve, a szerver aktív maradt!'))
+    .catch(err => console.log('❌ [Ébrentartó] Ping hiba:', err.message));
+}, 14 * 60 * 1000); // 14 percenként lefuttatja (a Render 15 perc után altatna el)
+
 // A szerver elindítása
 app.listen(PORT, () => {
   console.log(`Szerver elindítva a http://localhost:${PORT} címen`);
