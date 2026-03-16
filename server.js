@@ -166,7 +166,7 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
         }
 
         // --- OKOS ADATBÁZIS MENTÉS ÉS MECCSENKÉNTI LP KISZÁMÍTÁSA ---
-        let lpChanges = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
+        let dailyStats = { 'RANKED_SOLO_5x5': null, 'RANKED_FLEX_SR': null };
         let matchLpChanges = {};
         let lpHistory = { 'RANKED_SOLO_5x5': [], 'RANKED_FLEX_SR': [] }; // Grafikon adatok
 
@@ -193,22 +193,45 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
                             await newRecord.save();
                         }
 
-                        const historyRecords = await PlayerHistory.find({ puuid: puuid, queueType: qType }).sort({ date: -1 }).limit(20);
+                        const historyRecords = await PlayerHistory.find({ puuid: puuid, queueType: qType }).sort({ date: -1 }).limit(30);
                         if (historyRecords.length >= 2) {
-                            const currentAbsLp = calculateAbsoluteLp(historyRecords[0].tier, historyRecords[0].rank, historyRecords[0].leaguePoints);
-                            const previousAbsLp = calculateAbsoluteLp(historyRecords[1].tier, historyRecords[1].rank, historyRecords[1].leaguePoints);
-                            lpChanges[qType] = currentAbsLp - previousAbsLp;
+                            // Porofessor-stílusú NAPI (24 órás) Session kiszámítása
+                            const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+                            const recentRecords = historyRecords.filter(r => new Date(r.date) >= oneDayAgo);
+                            
+                            if (recentRecords.length > 0) {
+                                let baselineRecord = historyRecords.find(r => new Date(r.date) < oneDayAgo);
+                                if (!baselineRecord) baselineRecord = historyRecords[historyRecords.length - 1]; // Ha nincs régebbi, a legrégebbit vesszük
+                                
+                                if (baselineRecord && baselineRecord.date.getTime() !== historyRecords[0].date.getTime()) {
+                                    const currentLp = calculateAbsoluteLp(historyRecords[0].tier, historyRecords[0].rank, historyRecords[0].leaguePoints);
+                                    const baselineLp = calculateAbsoluteLp(baselineRecord.tier, baselineRecord.rank, baselineRecord.leaguePoints);
+                                    const wDiff = historyRecords[0].wins - baselineRecord.wins;
+                                    const lDiff = historyRecords[0].losses - baselineRecord.losses;
+                                    
+                                    if (wDiff > 0 || lDiff > 0) {
+                                        dailyStats[qType] = { lpChange: currentLp - baselineLp, wins: wDiff, losses: lDiff };
+                                    }
+                                }
+                            }
 
+                            // Meccsenkénti pontos LP leosztás (Dodge detektálás és átlagolás)
                             for (let i = 0; i < historyRecords.length - 1; i++) {
                                 const curr = historyRecords[i], prev = historyRecords[i+1];
-                                if (curr.matchId) {
-                                    matchLpChanges[curr.matchId] = calculateAbsoluteLp(curr.tier, curr.rank, curr.leaguePoints) - calculateAbsoluteLp(prev.tier, prev.rank, prev.leaguePoints);
+                                const gamesDiff = (curr.wins + curr.losses) - (prev.wins + prev.losses);
+                                const lpDiff = calculateAbsoluteLp(curr.tier, curr.rank, curr.leaguePoints) - calculateAbsoluteLp(prev.tier, prev.rank, prev.leaguePoints);
+                                
+                                if (curr.matchId && gamesDiff > 0) {
+                                    matchLpChanges[curr.matchId] = Math.round(lpDiff / gamesDiff);
+                                } else if (curr.matchId && gamesDiff === 0 && lpDiff !== 0) {
+                                    // Ha nincs új meccs, de LP csökkent (pl. Hősök választásánál kilépés / Dodge)
+                                    matchLpChanges[curr.matchId] = lpDiff;
                                 }
                             }
                         }
                         
                         // Időrendben (legrégebbi elöl) mentjük az LP adatokat a grafikonhoz
-                        lpHistory[qType] = historyRecords.reverse().map(r => ({
+                        lpHistory[qType] = historyRecords.slice(0, 20).reverse().map(r => ({
                             lp: r.leaguePoints,
                             tier: r.tier,
                             rank: r.rank,
@@ -228,7 +251,7 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
             rankedData: leagueData,
             matchHistory: matchHistory,
             masteryData: masteryData,
-            lpChanges: lpChanges,
+            dailyStats: dailyStats,
             matchLpChanges: matchLpChanges,
             lpHistory: lpHistory
         };
