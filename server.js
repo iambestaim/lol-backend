@@ -215,6 +215,8 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
                                 }
                             }
 
+                            const qMatches = qType === 'RANKED_SOLO_5x5' ? soloMatches : flexMatches;
+
                             // Meccsenkénti pontos LP leosztás (Dodge detektálás és átlagolás)
                             for (let i = 0; i < historyRecords.length - 1; i++) {
                                 const curr = historyRecords[i], prev = historyRecords[i+1];
@@ -222,10 +224,48 @@ app.get('/summoner/:region/:riotId', async (req, res) => {
                                 const lpDiff = calculateAbsoluteLp(curr.tier, curr.rank, curr.leaguePoints) - calculateAbsoluteLp(prev.tier, prev.rank, prev.leaguePoints);
                                 
                                 if (curr.matchId && gamesDiff > 0) {
-                                    matchLpChanges[curr.matchId] = Math.round(lpDiff / gamesDiff);
+                                    const idx = qMatches.findIndex(m => m.metadata.matchId === curr.matchId);
+                                    
+                                    if (idx !== -1 && idx + gamesDiff <= qMatches.length) {
+                                        // Megvan a történetben az összes köztes meccs
+                                        const matchesInDelta = qMatches.slice(idx, idx + gamesDiff).map(m => {
+                                            const p = m.info.participants.find(part => part.puuid === puuid);
+                                            return { matchId: m.metadata.matchId, win: p ? p.win : false };
+                                        });
+
+                                        let nw = matchesInDelta.filter(m => m.win).length;
+                                        let nl = matchesInDelta.filter(m => !m.win).length;
+                                        
+                                        let W = 22, L = -17; // Alapértelmezett LP értékek
+
+                                        if (nw === 0) { L = lpDiff / nl; if (L >= 0 && lpDiff < 0) L = -1; }
+                                        else if (nl === 0) { W = lpDiff / nw; if (W <= 0 && lpDiff > 0) W = 1; }
+                                        else {
+                                            // Nyers összeg és korrekciós elosztás
+                                            let diff = lpDiff - ((nw * W) + (nl * L));
+                                            W += diff / (nw + nl); L += diff / (nw + nl);
+                                            // Biztosítjuk a helyes előjeleket extrém kilengés esetén is
+                                            if (W <= 0) { W = 1; L = (lpDiff - nw * W) / nl; }
+                                            else if (L >= 0) { L = -1; W = (lpDiff - nl * L) / nw; }
+                                        }
+
+                                        W = Math.round(W); L = Math.round(L);
+                                        let remainder = lpDiff - ((nw * W) + (nl * L)); // Kerekítési maradék
+
+                                        matchesInDelta.forEach(m => {
+                                            let val = m.win ? W : L;
+                                            if (remainder !== 0 && ((m.win && val + remainder > 0) || (!m.win && val + remainder < 0))) {
+                                                val += remainder; remainder = 0; // Maradék rárakása egy alkalmas meccsre
+                                            }
+                                            matchLpChanges[m.matchId] = (matchLpChanges[m.matchId] || 0) + val;
+                                        });
+                                    } else {
+                                        // Fallback: Ha már túl régi meccsek, csak elosztjuk a legutolsóra
+                                        matchLpChanges[curr.matchId] = (matchLpChanges[curr.matchId] || 0) + Math.round(lpDiff / gamesDiff);
+                                    }
                                 } else if (curr.matchId && gamesDiff === 0 && lpDiff !== 0) {
                                     // Ha nincs új meccs, de LP csökkent (pl. Hősök választásánál kilépés / Dodge)
-                                    matchLpChanges[curr.matchId] = lpDiff;
+                                    matchLpChanges[curr.matchId] = (matchLpChanges[curr.matchId] || 0) + lpDiff;
                                 }
                             }
                         }
